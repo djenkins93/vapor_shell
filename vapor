@@ -1,0 +1,901 @@
+#!/usr/bin/env bash
+#===============================================================================
+# VaporShell v2.8 — Ephemeral, Encrypted, Isolated Shell Environment
+# 
+# A privacy-hardened utility combining:
+#   - Quixand: Single-use unrecoverable encrypted workspaces
+#   - Bubblewrap: Namespace isolation and process containment
+#   - Optional Tor routing via network namespace enforcement
+#   - Memory zeroing on cleanup for enhanced security
+#
+# Session data lives under a per-run directory (typically /tmp); nothing is written to your real home directory.
+#
+# Command: vapor
+# Author: Layer Cake Labs
+# License: MIT
+#===============================================================================
+# DEBUGG/MODIFICATIONS 
+#  -1. Change dim effect tool/menu listings
+#  -2. The paranoid 'mode' seems to not work at all
+#  -3. Other than that make sure to build a 'man', READme', and  edit comments
+
+set -euo pipefail
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+
+readonly VERSION="2.8.0"
+readonly SCRIPT_NAME="vapor"
+readonly TOOL_NAME="VaporShell"
+
+# Runtime - Session data stored under /tmp (may be tmpfs or disk depending on host); encrypted workspace is crypto-erased on exit
+SESSION_ID="$(head -c 16 /dev/urandom | { command -v hexdump >/dev/null && hexdump -ve '1/1 "%02x"' || od -An -tx1 | tr -d ' 
+'; } )"
+readonly SESSION_BASE="/tmp/vaporshell-${SESSION_ID}"
+readonly SESSION_CONFIG="${SESSION_BASE}/config"
+
+# State tracking
+CLEANUP_DONE=false
+QUIXAND_ACTIVE=false
+NETNS_ACTIVE=false
+NETNS_NAME="vs_${SESSION_ID:0:8}"
+
+# Mode settings (set by load_mode)
+NAME=""
+PS1_GLYPH=""
+TORIFY=false
+NETWORK="none"
+HIDE_PROC=false
+
+# Defaults
+DEFAULT_MODE="default"
+TOR_TRANS_PORT=9040
+TOR_DNS_PORT=5353
+TOR_SOCKS_PORT=9050
+
+# Menu colors (auto-disable if not interactive)
+if [[ -t 1 ]]; then
+    readonly C_RESET='\033[0m'
+    readonly C_BOLD='\033[1m'
+    readonly C_DIM=''
+    readonly C_RED='\033[31m'
+    readonly C_GREEN='\033[32m'
+    readonly C_YELLOW='\033[33m'
+    readonly C_BLUE='\033[34m'
+    readonly C_MAGENTA='\033[35m'
+    readonly C_CYAN='\033[36m'
+    readonly C_WHITE='\033[97m'
+else
+    readonly C_RESET='' C_BOLD='' C_DIM='' C_RED='' C_GREEN=''
+    readonly C_YELLOW='' C_BLUE='' C_MAGENTA='' C_CYAN='' C_WHITE=''
+fi
+
+#===============================================================================
+# LOGGING
+#===============================================================================
+
+log_info()  { echo -e "${C_GREEN}[+]${C_RESET} $*" >&2; }
+log_warn()  { echo -e "${C_YELLOW}[!]${C_RESET} $*" >&2; }
+log_error() { echo -e "${C_RED}[✗]${C_RESET} $*" >&2; }
+log_debug() { [[ "${DEBUG:-0}" == "1" ]] && echo -e "[?] $*" >&2 || true; }
+
+#===============================================================================
+# INTERACTIVE MENU
+#===============================================================================
+
+menu_header() {
+    clear
+    echo -e "${C_BOLD}${C_CYAN}"
+    cat << 'EOF'
+                 _                                                                          
+                u                                                                           
+               88Nu.   u.               .d``                u.      .u    .                 
+              '88888.o888c       u      @8Ne.   .u    ...ue888b   .d88B :@8c  .             
+         .o@8  ^8888  8888    us888u.   %8888:u@88N   888R Y888r ="8888f8888r 88bu.         
+     .o@8888%   8888  8888 .@88 "8888"   `888I  888.  888R I888>   4888>'88"  %*8888eu.     
+ .o@8888%"      8888  8888 9888  9888     888I  888I  888R I888>   4888> '       ^%*8888eu  
+8888R"          8888  8888 9888  9888     888I  888I  888R I888>   4888>             "%8888 
+"*8888bu.      .8888b.888P 9888  9888   uW888L  888' u8888cJ888   .d888L .+        .o8888R% 
+   ^"*8888bu.   ^Y8888*""  9888  9888  '*88888Nu88P   "*888*P"    ^"8888*"     .o8888R%"    
+       ^%*888     `Y"      "888*""888" ~ '88888F`       'Y"          "Y"      8888%"        
+           ^%               ^Y"   ^Y'     888 ^                               %"            
+                                          *8E                                               
+                                          '8>                                               
+                                           "                                                
+                   	...You were never really here...
+EOF
+    echo -e "${C_RESET}"
+    echo -e "  Vapor - Ephemeral Encrypted Shell Environment"
+    echo -e "  Version ${VERSION}"
+    echo ""
+}
+
+menu_separator() {
+    echo -e "  ─────────────────────────────────────────"
+}
+
+show_interactive_menu() {
+    local choice=""
+    
+    while true; do
+        menu_header
+        
+        echo -e "  ${C_BOLD}${C_WHITE}SELECT MODE${C_RESET}"
+        echo ""
+        
+        printf "  ${C_BOLD}${C_WHITE}[1]${C_RESET}  "
+        printf "${C_CYAN}%-10s${C_RESET}" "default"
+        printf "👻  "
+        printf "${C_MAGENTA}◎ ${C_DIM}%-6s${C_RESET}  " "tor"
+        printf "${C_DIM}%s${C_RESET}\n" "Encrypted shell + Tor routing"
+        
+        printf "  ${C_BOLD}${C_WHITE}[2]${C_RESET}  "
+        printf "${C_CYAN}%-10s${C_RESET}" "paranoid"
+        printf "💀  "
+        printf "${C_GREEN}⊘ ${C_DIM}%-6s${C_RESET}  " "none"
+        printf "${C_DIM}%s${C_RESET}\n" "Maximum isolation, airgapped"
+        
+        echo ""
+        menu_separator
+        echo ""
+        
+        printf "  ${C_BOLD}${C_WHITE}[h]${C_RESET}  %-10s     ${C_DIM}%s${C_RESET}\n" "Help" "Usage information"
+        printf "  ${C_BOLD}${C_WHITE}[q]${C_RESET}  %-10s     ${C_DIM}%s${C_RESET}\n" "Quit" "Exit VaporShell"
+        
+        echo ""
+        menu_separator
+        echo ""
+        
+        echo -ne "  ${C_BOLD}${C_WHITE}▶${C_RESET} Select: "
+        read -r choice
+        
+        case "$choice" in
+            1|default) return_mode="default"; return 0 ;;
+            2|paranoid) return_mode="paranoid"; return 0 ;;
+            h|H) menu_show_help ;;
+            q|Q)
+                echo ""
+                echo -e "  ${C_DIM}Exiting VaporShell...${C_RESET}"
+                echo ""
+                exit 0
+                ;;
+            *) 
+                echo ""
+                echo -e "  ${C_RED}✗ Invalid selection${C_RESET}"
+                echo -ne "  ${C_DIM}Press any key to continue...${C_RESET}"
+                read -rsn1
+                ;;
+        esac
+    done
+}
+
+menu_show_help() {
+    clear
+    menu_header
+    echo -e "  ${C_BOLD}${C_WHITE}HELP${C_RESET}"
+    echo ""
+    menu_separator
+    echo ""
+    
+    echo -e "  ${C_CYAN}${C_BOLD}What is VaporShell?${C_RESET}"
+    echo -e "  ${C_DIM}An ephemeral shell environment where all data${C_RESET}"
+    echo -e "  ${C_DIM}is encrypted and destroyed when you exit.${C_RESET}"
+    echo -e "  ${C_DIM}Nothing is written to your home directory.${C_RESET}"
+    echo ""
+    
+    echo -e "  ${C_CYAN}${C_BOLD}Modes${C_RESET}"
+    echo -e "  ${C_WHITE}default${C_RESET}   ${C_DIM}Encrypted shell with Tor routing${C_RESET}"
+    echo -e "  ${C_WHITE}paranoid${C_RESET}  ${C_DIM}Maximum isolation, airgapped, no /proc${C_RESET}"
+    echo ""
+    
+    echo -e "  ${C_CYAN}${C_BOLD}Command Line${C_RESET}"
+    echo -e "  ${C_WHITE}vapor${C_RESET}              ${C_DIM}Launch default mode (Tor)${C_RESET}"
+    echo -e "  ${C_WHITE}vapor paranoid${C_RESET}     ${C_DIM}Launch paranoid mode${C_RESET}"
+    echo -e "  ${C_WHITE}vapor -i${C_RESET}           ${C_DIM}Interactive menu${C_RESET}"
+    echo ""
+    
+    echo -e "  ${C_CYAN}${C_BOLD}Inside a Session${C_RESET}"
+    echo -e "  ${C_DIM}• Work in /work or \$HOME${C_RESET}"
+    echo -e "  ${C_DIM}• All data is encrypted in RAM${C_RESET}"
+    echo -e "  ${C_DIM}• Type 'exit' to destroy session${C_RESET}"
+    echo ""
+    
+    menu_separator
+    echo -ne "  ${C_DIM}Press any key to return...${C_RESET}"
+    read -rsn1
+}
+
+return_mode=""
+
+#===============================================================================
+# DEPENDENCY CHECKING
+#===============================================================================
+
+check_dependencies() {
+    local missing=()
+    local required=(
+        "bwrap:bubblewrap"
+        "quixand:quixand"
+        "ip:iproute2"
+    )
+    
+    for dep in "${required[@]}"; do
+        local cmd="${dep%%:*}"
+        local pkg="${dep##*:}"
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$pkg ($cmd)")
+        fi
+    done
+    
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "Missing dependencies: ${missing[*]}"
+        exit 1
+    fi
+    
+    if [[ "${TORIFY:-false}" == "true" ]] && ! pgrep -x tor &>/dev/null; then
+        log_warn "Tor routing requested but tor daemon not running"
+    fi
+}
+
+#===============================================================================
+# PREFLIGHT SECURITY CHECKS
+#===============================================================================
+
+preflight_checks() {
+    log_info "Running preflight security checks..."
+    
+    if [[ -f /proc/sys/kernel/unprivileged_userns_clone ]]; then
+        if [[ $(cat /proc/sys/kernel/unprivileged_userns_clone) != "1" ]]; then
+            log_error "User namespaces disabled. Enable with: sysctl kernel.unprivileged_userns_clone=1"
+            exit 1
+        fi
+    fi
+    
+    if [[ ! -c /dev/fuse ]]; then
+        log_error "/dev/fuse not available. Load fuse module: modprobe fuse"
+        exit 1
+    fi
+    
+    # Check swap status and enforce encrypted swap
+    check_swap_security
+    
+    if [[ $EUID -eq 0 ]]; then
+        log_error "Do not run VaporShell as root"
+        exit 1
+    fi
+    
+    if [[ ! -w /tmp ]]; then
+        log_error "/tmp is not writable"
+        exit 1
+    fi
+    
+    log_info "Preflight checks passed"
+}
+
+#===============================================================================
+# SWAP SECURITY
+#===============================================================================
+
+check_swap_security() {
+    # Check if swap is enabled
+    if [[ ! -f /proc/swaps ]] || [[ $(wc -l < /proc/swaps) -le 1 ]]; then
+        log_debug "No swap enabled - good"
+        return 0
+    fi
+    
+    # Swap is enabled - check if it's encrypted
+    local swap_devices
+    swap_devices=$(tail -n +2 /proc/swaps | awk '{print $1}')
+    
+    local has_unencrypted=false
+    local swap_info=""
+    
+    for device in $swap_devices; do
+        if is_swap_encrypted "$device"; then
+            log_debug "Swap device $device is encrypted"
+        else
+            has_unencrypted=true
+            swap_info="$device"
+        fi
+    done
+    
+    if [[ "$has_unencrypted" == "true" ]]; then
+        log_warn "Unencrypted swap detected: $swap_info"
+        log_warn "Sensitive data may be written to disk!"
+        echo ""
+        echo -e "${C_YELLOW}  Options:${C_RESET}"
+        echo -e "    ${C_WHITE}1)${C_RESET} Disable swap now (requires sudo)"
+        echo -e "    ${C_WHITE}2)${C_RESET} Continue anyway (not recommended)"
+        echo -e "    ${C_WHITE}3)${C_RESET} Exit"
+        echo ""
+        echo -ne "  ${C_BOLD}Select [3]:${C_RESET} "
+        read -r swap_choice
+        
+        case "$swap_choice" in
+            1)
+                disable_swap
+                ;;
+            2)
+                log_warn "Continuing with unencrypted swap - security reduced"
+                ;;
+            *)
+                log_info "Exiting. Disable swap with: sudo swapoff -a"
+                exit 0
+                ;;
+        esac
+    fi
+}
+
+is_swap_encrypted() {
+    local device="$1"
+    
+    # Check if device is a dm-crypt device
+    if [[ "$device" == /dev/dm-* ]] || [[ "$device" == /dev/mapper/* ]]; then
+        return 0
+    fi
+    
+    # Check if device is backed by LUKS
+    local real_device="$device"
+    if [[ -L "$device" ]]; then
+        real_device=$(readlink -f "$device")
+    fi
+    
+    # Check for dm-crypt backing
+    if [[ -e "/sys/block/$(basename "$real_device" 2>/dev/null)/dm/name" ]] 2>/dev/null; then
+        return 0
+    fi
+    
+    # Check if cryptsetup recognizes it
+    if command -v cryptsetup &>/dev/null; then
+        if cryptsetup status "$real_device" &>/dev/null; then
+            return 0
+        fi
+    fi
+    
+    # Check /etc/crypttab for swap entries
+    if [[ -f /etc/crypttab ]]; then
+        local base_name=$(basename "$device")
+        if grep -q "swap" /etc/crypttab 2>/dev/null; then
+            if grep -qE "(${base_name}|${device})" /etc/crypttab 2>/dev/null; then
+                return 0
+            fi
+        fi
+    fi
+    
+    # Assume unencrypted
+    return 1
+}
+
+disable_swap() {
+    log_info "Attempting to disable swap..."
+    
+    if sudo -n true 2>/dev/null; then
+        if sudo swapoff -a; then
+            log_info "Swap disabled successfully"
+        else
+            log_error "Failed to disable swap"
+            exit 1
+        fi
+    else
+        log_info "Sudo password required to disable swap"
+        if sudo swapoff -a; then
+            log_info "Swap disabled successfully"
+        else
+            log_error "Failed to disable swap"
+            exit 1
+        fi
+    fi
+}
+
+#===============================================================================
+# QUIXAND WORKSPACE MANAGEMENT
+#===============================================================================
+
+setup_quixand_workspace() {
+    log_info "Initializing encrypted workspace in /tmp..."
+    
+    # Create session directory structure
+    mkdir -p "$SESSION_BASE" "$SESSION_CONFIG"
+    chmod 700 "$SESSION_BASE"
+    
+    log_debug "Session base: $SESSION_BASE"
+    log_debug "Quixand config: $SESSION_CONFIG"
+    
+    # Create the workspace directories that Quixand will encrypt
+    local ws_tmp="${SESSION_BASE}/ws_tmp"
+    local ws_home="${SESSION_BASE}/ws_home"
+    local ws_work="${SESSION_BASE}/ws_work"
+    
+    mkdir -p "$ws_tmp" "$ws_home" "$ws_work"
+    chmod 700 "$ws_tmp" "$ws_home" "$ws_work"
+    
+    log_debug "Created workspace dirs: $ws_tmp $ws_home $ws_work"
+    log_debug "Invoking quixand..."
+    
+    local quixand_output
+    if quixand_output=$(quixand -c "$SESSION_CONFIG" -d "$ws_tmp" "$ws_home" "$ws_work" 2>&1); then
+        log_debug "Quixand initialized successfully"
+    else
+        log_debug "First attempt failed, trying --dir syntax..."
+        if quixand_output=$(quixand -c "$SESSION_CONFIG" --dir "$ws_tmp" "$ws_home" "$ws_work" 2>&1); then
+            log_debug "Quixand initialized with --dir"
+        else
+            log_error "Failed to initialize Quixand workspace"
+            log_debug "Quixand output: $quixand_output"
+            return 1
+        fi
+    fi
+    
+    QUIXAND_ACTIVE=true
+    
+    sleep 0.2
+    
+    # Verify workspace is functional
+    if [[ -L "$ws_home" ]]; then
+        log_debug "ws_home is now a symlink: $(readlink "$ws_home")"
+    elif [[ -d "$ws_home" ]]; then
+        log_debug "ws_home is a directory (quixand may work differently)"
+    else
+        log_error "ws_home doesn't exist after quixand init"
+        return 1
+    fi
+    
+    # Test write access
+    if touch "${ws_home}/.vapor_test" 2>/dev/null; then
+        rm -f "${ws_home}/.vapor_test"
+        log_debug "Write test passed"
+    else
+        log_error "Cannot write to encrypted workspace"
+        return 1
+    fi
+    
+    log_info "Encrypted workspace ready: ${SESSION_BASE}"
+    printf '%s' "$SESSION_BASE"
+}
+
+teardown_quixand_workspace() {
+    if [[ "$QUIXAND_ACTIVE" == "true" ]]; then
+        # Always attempt crypto-erase on exit when config exists (defense in depth)
+
+        log_debug "Purging encrypted workspace (key destruction)..."
+        
+        local ws_tmp="${SESSION_BASE}/ws_tmp"
+        local ws_home="${SESSION_BASE}/ws_home"
+        local ws_work="${SESSION_BASE}/ws_work"
+        
+        # Secure wipe workspace contents before quixand purge
+        secure_wipe_directory "$ws_tmp"
+        secure_wipe_directory "$ws_home"
+        secure_wipe_directory "$ws_work"
+        
+        # Purge quixand - destroys encryption keys
+        quixand -c "$SESSION_CONFIG" -p -d "$ws_tmp" "$ws_home" "$ws_work" 2>/dev/null || true
+        quixand -c "$SESSION_CONFIG" --purge --dir "$ws_tmp" "$ws_home" "$ws_work" 2>/dev/null || true
+        
+        QUIXAND_ACTIVE=false
+    fi
+
+    # If Quixand was initialized but state flags got out of sync, attempt a final purge anyway.
+    if [[ -d "$SESSION_CONFIG" ]]; then
+        local ws_tmp_f="${SESSION_BASE}/ws_tmp"
+        local ws_home_f="${SESSION_BASE}/ws_home"
+        local ws_work_f="${SESSION_BASE}/ws_work"
+        quixand -c "$SESSION_CONFIG" -p -d "$ws_tmp_f" "$ws_home_f" "$ws_work_f" 2>/dev/null || true
+        quixand -c "$SESSION_CONFIG" --purge --dir "$ws_tmp_f" "$ws_home_f" "$ws_work_f" 2>/dev/null || true
+    fi
+
+    # Secure removal of session directories
+    if [[ -d "$SESSION_BASE" ]]; then
+        log_debug "Removing session directory: $SESSION_BASE"
+        secure_wipe_directory "$SESSION_BASE"
+        rm -rf "$SESSION_BASE" 2>/dev/null || true
+    fi
+    
+    # Zero sensitive variables
+    zero_sensitive_vars
+    
+    log_info "Workspace destroyed (data unrecoverable)"
+}
+
+#===============================================================================
+# MEMORY SECURITY
+#===============================================================================
+
+secure_wipe_file() {
+    local file="$1"
+    
+    if [[ -f "$file" && -w "$file" ]]; then
+        local size
+        size=$(stat -c%s "$file" 2>/dev/null) || return 0
+        
+        if [[ "$size" -gt 0 ]]; then
+            dd if=/dev/zero of="$file" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+            dd if=/dev/urandom of="$file" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+            dd if=/dev/zero of="$file" bs=1 count="$size" conv=notrunc 2>/dev/null || true
+            sync
+        fi
+    fi
+}
+
+secure_wipe_directory() {
+    local dir="$1"
+    
+    [[ -d "$dir" ]] || return 0
+    
+    log_debug "Secure wiping: $dir"
+    
+    while IFS= read -r -d '' file; do
+        secure_wipe_file "$file"
+    done < <(find "$dir" -type f -print0 2>/dev/null)
+}
+
+zero_sensitive_vars() {
+    local zero_pad
+    zero_pad=$(printf '%0128d' 0)
+    
+    SESSION_ID="$zero_pad"
+    NETNS_NAME="$zero_pad"
+    
+    unset SESSION_ID NETNS_NAME 2>/dev/null || true
+    
+    log_debug "Sensitive variables zeroed"
+}
+
+#===============================================================================
+# NETWORK NAMESPACE & TOR ROUTING
+#===============================================================================
+
+setup_network_namespace() {
+    if [[ "${TORIFY:-false}" != "true" ]]; then
+        log_debug "Tor routing disabled for this mode"
+        return 0
+    fi
+    
+    log_info "Setting up Tor routing..."
+    
+    if ip netns add "$NETNS_NAME" 2>/dev/null; then
+        NETNS_ACTIVE=true
+        
+        ip netns exec "$NETNS_NAME" ip link set lo up
+        ip link add "veth_${NETNS_NAME}" type veth peer name "veth_${NETNS_NAME}_ns"
+        ip link set "veth_${NETNS_NAME}_ns" netns "$NETNS_NAME"
+        ip addr add 10.200.1.1/24 dev "veth_${NETNS_NAME}"
+        ip link set "veth_${NETNS_NAME}" up
+        ip netns exec "$NETNS_NAME" ip addr add 10.200.1.2/24 dev "veth_${NETNS_NAME}_ns"
+        ip netns exec "$NETNS_NAME" ip link set "veth_${NETNS_NAME}_ns" up
+        ip netns exec "$NETNS_NAME" ip route add default via 10.200.1.1
+        
+        setup_tor_routing
+        
+        log_info "Tor routing: enforced (network namespace)"
+        return 0
+    else
+        log_info "Tor routing: SOCKS proxy (apps use \$ALL_PROXY)"
+        log_debug "Network namespace requires root - using proxy fallback"
+        return 1
+    fi
+}
+
+setup_tor_routing() {
+    iptables -t nat -A PREROUTING -i "veth_${NETNS_NAME}" -p tcp --syn -j REDIRECT --to-ports "$TOR_TRANS_PORT" 2>/dev/null || true
+    iptables -t nat -A PREROUTING -i "veth_${NETNS_NAME}" -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT" 2>/dev/null || true
+    iptables -A FORWARD -i "veth_${NETNS_NAME}" -j DROP 2>/dev/null || true
+    log_debug "Tor transparent proxy rules applied"
+}
+
+teardown_network_namespace() {
+    if [[ "$NETNS_ACTIVE" == "true" ]]; then
+        log_debug "Removing network namespace..."
+        iptables -t nat -D PREROUTING -i "veth_${NETNS_NAME}" -p tcp --syn -j REDIRECT --to-ports "$TOR_TRANS_PORT" 2>/dev/null || true
+        iptables -t nat -D PREROUTING -i "veth_${NETNS_NAME}" -p udp --dport 53 -j REDIRECT --to-ports "$TOR_DNS_PORT" 2>/dev/null || true
+        iptables -D FORWARD -i "veth_${NETNS_NAME}" -j DROP 2>/dev/null || true
+        ip link delete "veth_${NETNS_NAME}" 2>/dev/null || true
+        ip netns delete "$NETNS_NAME" 2>/dev/null || true
+        NETNS_ACTIVE=false
+    fi
+}
+
+#===============================================================================
+# BUBBLEWRAP SANDBOX
+#===============================================================================
+
+build_bwrap_args() {
+    local encrypted_workspace="$1"
+    local -n args_ref=$2
+    
+    local ws_home="${encrypted_workspace}/ws_home"
+    local ws_work="${encrypted_workspace}/ws_work"
+    local ws_tmp="${encrypted_workspace}/ws_tmp"
+    
+    if [[ ! -e "$ws_home" ]]; then
+        log_error "Encrypted workspace home not found: $ws_home"
+        return 1
+    fi
+    if [[ ! -e "$ws_work" ]]; then
+        log_error "Encrypted workspace work not found: $ws_work"
+        return 1
+    fi
+    if [[ ! -e "$ws_tmp" ]]; then
+        log_error "Encrypted workspace tmp not found: $ws_tmp"
+        return 1
+    fi
+    
+    log_debug "Workspace paths verified:"
+    log_debug "  home: $ws_home $([[ -L $ws_home ]] && echo '[symlink]' || echo '[dir]')"
+    log_debug "  work: $ws_work $([[ -L $ws_work ]] && echo '[symlink]' || echo '[dir]')"
+    log_debug "  tmp:  $ws_tmp $([[ -L $ws_tmp ]] && echo '[symlink]' || echo '[dir]')"
+    
+    # Core namespace isolation
+    args_ref+=(
+        --unshare-user
+        --unshare-pid
+        --unshare-uts
+        --unshare-ipc
+        --unshare-cgroup
+    )
+    
+    # Network handling
+    if [[ "$NETNS_ACTIVE" == "true" ]]; then
+        args_ref+=(--share-net)
+    elif [[ "${TORIFY:-false}" == "true" ]]; then
+        args_ref+=(
+            --share-net
+            --setenv ALL_PROXY "socks5://127.0.0.1:$TOR_SOCKS_PORT"
+            --setenv http_proxy "socks5://127.0.0.1:$TOR_SOCKS_PORT"
+            --setenv https_proxy "socks5://127.0.0.1:$TOR_SOCKS_PORT"
+        )
+    else
+        args_ref+=(--unshare-net)
+    fi
+    
+    # Session and capability controls
+    args_ref+=(
+        --new-session
+        --die-with-parent
+        --cap-drop ALL
+    )
+    
+    # Filesystem: minimal read-only base system
+    args_ref+=(--ro-bind /usr /usr)
+    
+    # Handle /bin
+    if [[ -L /bin ]]; then
+        args_ref+=(--symlink usr/bin /bin)
+    else
+        args_ref+=(--ro-bind /bin /bin)
+    fi
+    
+    # Handle /lib
+    if [[ -L /lib ]]; then
+        args_ref+=(--symlink usr/lib /lib)
+    else
+        args_ref+=(--ro-bind /lib /lib)
+    fi
+    
+    # Handle /lib64
+    if [[ -L /lib64 ]]; then
+        args_ref+=(--symlink usr/lib /lib64)
+    elif [[ -d /lib64 ]]; then
+        args_ref+=(--ro-bind /lib64 /lib64)
+    fi
+    
+    # Handle /lib32
+    if [[ -L /lib32 ]]; then
+        args_ref+=(--symlink usr/lib32 /lib32)
+    elif [[ -d /lib32 ]]; then
+        args_ref+=(--ro-bind /lib32 /lib32)
+    fi
+    
+    # Handle /sbin
+    if [[ -L /sbin ]]; then
+        args_ref+=(--symlink usr/sbin /sbin)
+    elif [[ -d /sbin ]]; then
+        args_ref+=(--ro-bind /sbin /sbin)
+    fi
+    
+    # Essential /etc files
+    for etc_file in alternatives ld.so.cache ld.so.conf ld.so.conf.d passwd group nsswitch.conf; do
+        [[ -e "/etc/$etc_file" ]] && args_ref+=(--ro-bind "/etc/$etc_file" "/etc/$etc_file")
+    done
+    
+    # Special filesystems
+    if [[ "${HIDE_PROC:-false}" == "true" ]]; then
+        args_ref+=(
+            --tmpfs /proc
+            --dev /dev
+            --tmpfs /run
+        )
+        log_debug "Paranoid: /proc hidden"
+        # Provide PTYs for interactive shells (avoids 'no job control' warnings)
+        if [[ -d /dev/pts ]]; then
+            args_ref+=(--dev-bind /dev/pts /dev/pts)
+        fi
+        if [[ -e /dev/ptmx ]]; then
+            args_ref+=(--dev-bind /dev/ptmx /dev/ptmx)
+        fi
+
+    else
+        args_ref+=(
+            --proc /proc
+            --dev /dev
+            --tmpfs /run
+        )
+        # Provide PTYs for interactive shells (avoids 'no job control' warnings)
+        if [[ -d /dev/pts ]]; then
+            args_ref+=(--dev-bind /dev/pts /dev/pts)
+        fi
+        if [[ -e /dev/ptmx ]]; then
+            args_ref+=(--dev-bind /dev/ptmx /dev/ptmx)
+        fi
+
+    fi
+    
+    # Encrypted workspace bindings
+    args_ref+=(
+        --bind "${encrypted_workspace}/ws_home" /home/user
+        --bind "${encrypted_workspace}/ws_work" /work
+        --bind "${encrypted_workspace}/ws_tmp" /tmp
+    )
+    
+    # DNS configuration
+    local resolv_conf="${SESSION_BASE}/resolv.conf"
+    echo "nameserver 127.0.0.1" > "$resolv_conf"
+    args_ref+=(--ro-bind "$resolv_conf" /etc/resolv.conf)
+    
+    # Environment sanitization
+    args_ref+=(
+        --clearenv
+        --setenv PATH "/usr/bin:/bin"
+        --setenv TERM "${TERM:-xterm-256color}"
+        --setenv HOME "/home/user"
+        --setenv USER "user"
+        --setenv SHELL "/bin/bash"
+        --setenv PS1 "[${NAME} ${PS1_GLYPH}] \u:\w\$ "
+        --setenv HISTFILE "/dev/null"
+        --setenv LANG "${LANG:-C.UTF-8}"
+        --setenv LC_ALL ""
+        --setenv TZ "UTC"
+    )
+}
+
+#===============================================================================
+# MODE MANAGEMENT
+#===============================================================================
+
+load_mode() {
+    local mode_name="$1"
+    
+    case "$mode_name" in
+        default)
+            NAME="default"
+            PS1_GLYPH="👻"
+            TORIFY=true
+            NETWORK="tor"
+            HIDE_PROC=false
+            ;;
+        paranoid)
+            NAME="paranoid"
+            PS1_GLYPH="💀"
+            TORIFY=false
+            NETWORK="none"
+            HIDE_PROC=true
+            ;;
+        *)
+            log_error "Unknown mode: $mode_name"
+            log_info "Available modes: default, paranoid"
+            exit 1
+            ;;
+    esac
+    
+    log_info "Loading mode: $mode_name"
+}
+
+#===============================================================================
+# CLEANUP
+#===============================================================================
+
+cleanup() {
+    if [[ "$CLEANUP_DONE" == "true" ]]; then
+        return 0
+    fi
+    CLEANUP_DONE=true
+    
+    log_info "Initiating secure cleanup..."
+    teardown_network_namespace
+    teardown_quixand_workspace
+    sync 2>/dev/null || true
+    log_info "Session terminated."
+}
+
+setup_signal_handlers() {
+    trap cleanup EXIT
+    trap 'log_warn "Interrupted"; cleanup; exit 130' INT
+    trap 'log_warn "Terminated"; cleanup; exit 143' TERM
+    trap 'log_warn "Hangup"; cleanup; exit 129' HUP
+}
+
+#===============================================================================
+# MAIN
+#===============================================================================
+
+show_usage() {
+    cat << EOF
+$TOOL_NAME v$VERSION — Ephemeral Encrypted Isolated Shell
+
+Usage: $SCRIPT_NAME [OPTIONS] [MODE]
+
+Options:
+  -i, --interactive  Launch interactive menu
+  -d, --debug        Enable debug output
+  -h, --help         Show this help
+  -v, --version      Show version
+
+Modes:
+  default   Encrypted ephemeral shell + Tor routing (default)
+  paranoid  Maximum isolation, airgapped, no /proc access
+
+All session data encrypted in /tmp, securely wiped on exit.
+EOF
+}
+
+main() {
+    local mode="$DEFAULT_MODE"
+    local use_menu=false
+    
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -i|--interactive|--menu) use_menu=true; shift ;;
+            -d|--debug) export DEBUG=1; shift ;;
+            -h|--help) show_usage; exit 0 ;;
+            -v|--version) echo "$TOOL_NAME v$VERSION"; exit 0 ;;
+            -*) log_error "Unknown option: $1"; show_usage; exit 1 ;;
+            *) mode="$1"; shift ;;
+        esac
+    done
+    
+    [[ "$use_menu" == "true" ]] && { show_interactive_menu; mode="$return_mode"; }
+    
+    setup_signal_handlers
+    check_dependencies
+    preflight_checks
+    load_mode "$mode"
+    
+    local encrypted_workspace
+    encrypted_workspace=$(setup_quixand_workspace)
+    
+    if [[ -z "$encrypted_workspace" ]] || [[ ! -d "$encrypted_workspace" ]]; then
+        log_error "Failed to establish encrypted workspace"
+        exit 1
+    fi
+    
+    local use_netns=false
+    [[ "${TORIFY:-false}" == "true" ]] && setup_network_namespace && use_netns=true
+    
+    local -a bwrap_args=()
+    if ! build_bwrap_args "$encrypted_workspace" bwrap_args; then
+        log_error "Failed to build sandbox configuration"
+        exit 1
+    fi
+    
+    echo ""
+    log_info "═══════════════════════════════════════════════════"
+    log_info " $TOOL_NAME Session: ${SESSION_ID:0:16}"
+    log_info " Mode: $NAME $PS1_GLYPH"
+    log_info " Network: ${NETWORK:-none}"
+    log_info " Workspace: /tmp (encrypted, ephemeral)"
+    log_info "═══════════════════════════════════════════════════"
+    echo ""
+    log_info "Type 'exit' to destroy session"
+    echo ""
+    
+    local shell_cmd=(/bin/bash --noprofile --norc)
+    
+    if [[ "$use_netns" == "true" ]]; then
+        ip netns exec "$NETNS_NAME" bwrap "${bwrap_args[@]}" -- "${shell_cmd[@]}"
+    else
+        bwrap "${bwrap_args[@]}" -- "${shell_cmd[@]}"
+    fi
+}
+
+main "$@"

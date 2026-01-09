@@ -1,0 +1,95 @@
+.TH vapor 1 "January 2026" "VaporShell" "User Commands"
+.SH NAME
+vapor \- ephemeral isolated shell session (optional encrypted workspace)
+.SH SYNOPSIS
+.B vapor
+[\fIOPTIONS\fR] [\fIMODE\fR]
+.SH DESCRIPTION
+VaporShell launches an ephemeral shell environment isolated with Linux namespaces (Bubblewrap).
+Sessions may be backed by a single-use encrypted workspace (Quixand) and may use Tor-oriented networking.
+
+On exit, VaporShell attempts Quixand purge (key destruction / crypto-erase) and removes per-session directories.
+Any plaintext overwrites are best-effort and not a provable secure wipe on modern storage.
+
+VaporShell is intended as a security engineering proof-of-concept and a practical local sandbox wrapper.
+.SH OPTIONS
+.TP
+.BR \-i ", " \-\-interactive
+Launch an interactive mode selection menu.
+.TP
+.BR \-d ", " \-\-debug
+Enable debug output to stderr.
+.TP
+.BR \-h ", " \-\-help
+Show usage text and exit.
+.TP
+.BR \-v ", " \-\-version
+Show version information and exit.
+.TP
+.BR \-\-tor-required
+Fail closed: if Tor enforcement via network namespace is not possible, exit instead of falling back to proxy environment variables.
+.TP
+.BR \-\-leak-check
+Run a best-effort IP/DNS/proxy sanity check inside the sandbox before starting the interactive shell.
+.TP
+.BR \-\-seccomp-bpf " " \fIFILE\fR
+Pass a precompiled seccomp BPF filter to bubblewrap.
+.SH MODES
+.TP
+.B default
+Ephemeral isolated shell with Tor-oriented networking. Tor is enforced only when network namespace setup is available; otherwise behavior is best-effort.
+.TP
+.B paranoid
+Maximum isolation: airgapped networking and hides \fI/proc\fR (proc replaced with tmpfs).
+.SH SECURITY
+.SS Isolation
+VaporShell uses Bubblewrap namespaces and hardening flags including unshared user/pid/uts/ipc/cgroup namespaces, a new session, parent-death, a cleared environment, and a full capability drop.
+.SS Data destruction
+On exit, VaporShell attempts:
+.IP \[bu] 2
+Quixand purge (key destruction / crypto-erase) for the session workspace.
+.IP \[bu] 2
+Best-effort overwrites of plaintext artifacts under the session directory before removal.
+.PP
+Note: plaintext overwrites are not a provable secure wipe on SSD/NVMe, copy-on-write filesystems, journaling, snapshots, or backups. Crypto-erase via key destruction is the primary assurance.
+.SS Tor routing
+In \fBdefault\fR mode, VaporShell may enforce Tor routing using a network namespace when permitted. If namespace creation is not possible, it may fall back to proxy environment variables, which is best-effort.
+.SH FILES
+.TP
+.I /dev/shm/vaporshell-<id>/
+Preferred per-session workspace directory (RAM-backed on most systems).
+.TP
+.I /tmp/vaporshell-<id>/
+Fallback per-session workspace directory.
+.TP
+.I <session>/config/
+Per-session Quixand configuration.
+.SH EXAMPLES
+.TP
+Launch default mode:
+.B vapor
+.TP
+Launch paranoid mode:
+.B vapor paranoid
+.TP
+Launch interactive menu:
+.B vapor -i
+.TP
+Fail closed if Tor cannot be enforced:
+.B vapor --tor-required
+.TP
+Run leak check and then enter the session:
+.B vapor --leak-check
+.SH EXIT STATUS
+.TP
+.B 0
+Success.
+.TP
+.B 1
+Failure (dependency missing, preflight failure, workspace failure, or sandbox build failure).
+.SH NOTES
+If you see "no job control" warnings in containerized environments, ensure \fI/dev/pts\fR is available. This build binds \fI/dev/pts\fR into the sandbox to support interactive job control.
+.SH AUTHOR
+Layer Cake Labs
+.SH LICENSE
+MIT
